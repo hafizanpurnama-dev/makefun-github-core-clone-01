@@ -1,0 +1,7 @@
+# Git Forge
+__pycache__/
+*.pyc
+*.pyo
+repos/
+*.log
+.env
