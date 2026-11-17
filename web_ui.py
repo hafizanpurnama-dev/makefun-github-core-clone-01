@@ -1,355 +1,373 @@
 """
-Web UI: browse repos, files, and commits via HTML pages.
-Simple template rendering without external dependencies.
+web_ui.py — HTML rendering for the git forge web interface.
+
+Pure Python 3 stdlib — no template engine.  Renders:
+  - Repo index (list all repos, clone form)
+  - Repo home  (overview with tree / commits links)
+  - File tree  (browse directories; uses `git ls-tree`)
+  - File blob  (view file content; uses `git show`)
+  - Commit log (uses `git log`)
+
+Every public render_* method returns a full HTML string.
 """
+
 import os
+import subprocess
 import html
-import urllib.parse
+from urllib.parse import quote, unquote
 
-import repo_manager as rm
 
-TEMPLATES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates")
+# ── shared CSS ──────────────────────────────────────────────────
 
-# File extension -> emoji icon mapping
-FILE_ICONS = {
-    ".py": "🐍", ".js": "🟨", ".ts": "🔷", ".tsx": "⚛️", ".jsx": "⚛️",
-    ".html": "🌐", ".htm": "🌐", ".css": "🎨", ".scss": "🎨", ".less": "🎨",
-    ".json": "📋", ".xml": "📋", ".yaml": "📋", ".yml": "📋", ".toml": "📋",
-    ".md": "📝", ".markdown": "📝", ".rst": "📝", ".txt": "📄",
-    ".sh": "🐚", ".bash": "🐚", ".zsh": "🐚",
-    ".rs": "🦀", ".go": "🐹", ".java": "☕", ".kt": "🅱️", ".swift": "🍎",
-    ".c": "⚙️", ".cpp": "⚙️", ".h": "⚙️", ".hpp": "⚙️",
-    ".rb": "💎", ".php": "🐘", ".pl": "🐪",
-    ".png": "🖼️", ".jpg": "🖼️", ".jpeg": "🖼️", ".gif": "🖼️",
-    ".svg": "🖼️", ".ico": "🖼️", ".webp": "🖼️",
-    ".mp4": "🎬", ".mov": "🎬", ".avi": "🎬",
-    ".mp3": "🎵", ".wav": "🎵", ".ogg": "🎵",
-    ".pdf": "📕", ".doc": "📕", ".docx": "📕",
-    ".zip": "📦", ".tar": "📦", ".gz": "📦", ".bz2": "📦",
-    ".lock": "🔒", ".gitignore": "🙈", ".dockerignore": "🙈",
-    "Dockerfile": "🐳", "Makefile": "🔧", "LICENSE": "⚖️",
+_BASE_CSS = """
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  background: #0d1117; color: #c9d1d9; max-width: 960px;
+  margin: 0 auto; padding: 24px 16px;
 }
+a { color: #58a6ff; text-decoration: none; }
+a:hover { text-decoration: underline; }
+h1, h2, h3 { color: #f0f6fc; margin: 16px 0 8px; }
+pre, code {
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+  background: #161b22; border-radius: 6px; padding: 2px 6px;
+  font-size: 13px;
+}
+pre { padding: 16px; overflow-x: auto; line-height: 1.5; }
+table { width: 100%; border-collapse: collapse; margin: 12px 0; }
+th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid #21262d; }
+th { color: #8b949e; font-weight: 600; }
+input, button {
+  background: #21262d; color: #c9d1d9; border: 1px solid #30363d;
+  border-radius: 6px; padding: 8px 12px; font-size: 14px;
+}
+button { cursor: pointer; background: #238636; border-color: #2ea043; }
+button:hover { background: #2ea043; }
+input { width: 100%; max-width: 500px; }
+.nav { margin-bottom: 20px; padding-bottom: 8px; border-bottom: 1px solid #21262d; }
+.nav a { margin-right: 16px; }
+.breadcrumb { color: #8b949e; font-size: 14px; margin: 8px 0; }
+.breadcrumb a { color: #8b949e; }
+.flash { padding: 12px; border-radius: 6px; margin: 12px 0; }
+.flash-success { background: #0d3325; border: 1px solid #1a7f4b; }
+.flash-error   { background: #3d1215; border: 1px solid #8b3d40; }
+.empty { color: #8b949e; font-style: italic; margin: 16px 0; }
+.commit-hash { font-family: monospace; color: #7ee787; }
+.file-icon { margin-right: 6px; }
+.mode { color: #8b949e; font-size: 12px; }
+"""
 
 
-def file_icon(name: str) -> str:
-    """Get an emoji icon for a file based on its name/extension."""
-    basename = os.path.basename(name)
-    if basename in FILE_ICONS:
-        return FILE_ICONS[basename]
-    _, ext = os.path.splitext(basename)
-    return FILE_ICONS.get(ext.lower(), "📄")
-
-
-BASE_HTML = """<!DOCTYPE html>
+def _html_page(title: str, body: str) -> str:
+    """Wrap body content in a full HTML document with CSS."""
+    return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>{title} — Git Forge</title>
-<style>
-* {{ margin: 0; padding: 0; box-sizing: border-box; }}
-body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0d1117; color: #c9d1d9; }}
-a {{ color: #58a6ff; text-decoration: none; }}
-a:hover {{ text-decoration: underline; }}
-.header {{ background: #161b22; border-bottom: 1px solid #30363d; padding: 16px 24px; display: flex; align-items: center; gap: 16px; }}
-.header h1 {{ font-size: 20px; }}
-.header h1 a {{ color: #f0f6fc; }}
-.header .header-links {{ font-size: 14px; }}
-.header .header-links a {{ color: #8b949e; margin-left: 16px; }}
-.nav {{ background: #161b22; border-bottom: 1px solid #30363d; padding: 8px 24px; font-size: 14px; }}
-.nav a {{ margin-right: 16px; color: #8b949e; }}
-.nav a.active {{ color: #f0f6fc; font-weight: 600; }}
-.container {{ max-width: 960px; margin: 24px auto; padding: 0 24px; }}
-.repo-list {{ list-style: none; }}
-.repo-item {{ border: 1px solid #30363d; border-radius: 6px; padding: 16px; margin-bottom: 12px; background: #161b22; }}
-.repo-item h3 {{ font-size: 18px; margin-bottom: 4px; }}
-.repo-item .desc {{ color: #8b949e; margin-top: 4px; font-size: 13px; }}
-.repo-item .meta {{ font-size: 12px; color: #484f58; margin-top: 8px; }}
-.breadcrumb {{ font-size: 14px; padding: 12px 0; color: #8b949e; }}
-.breadcrumb a {{ color: #58a6ff; }}
-.file-list {{ list-style: none; border: 1px solid #30363d; border-radius: 6px; }}
-.file-row {{ display: flex; align-items: center; padding: 8px 16px; border-bottom: 1px solid #21262d; font-size: 14px; }}
-.file-row:last-child {{ border-bottom: none; }}
-.file-row:hover {{ background: #1c2128; }}
-.file-icon {{ width: 24px; margin-right: 8px; text-align: center; flex-shrink: 0; }}
-.file-name {{ flex: 1; }}
-.file-name.dir {{ font-weight: 600; }}
-.file-mode {{ font-size: 12px; color: #484f58; margin-left: 8px; font-family: monospace; }}
-.commit-list {{ list-style: none; border: 1px solid #30363d; border-radius: 6px; }}
-.commit-item {{ padding: 12px 16px; border-bottom: 1px solid #21262d; font-size: 14px; }}
-.commit-item:last-child {{ border-bottom: none; }}
-.commit-hash {{ font-family: monospace; font-size: 12px; color: #8b949e; background: #21262d; padding: 2px 6px; border-radius: 4px; }}
-.commit-msg {{ font-weight: 600; }}
-.commit-meta {{ font-size: 12px; color: #8b949e; margin-top: 4px; }}
-.code-block {{ background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 16px; overflow-x: auto; }}
-.code-block pre {{ font-family: "SF Mono", "Fira Code", monospace; font-size: 13px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; }}
-.code-block .line {{ display: table-row; }}
-.code-block .line-num {{ display: table-cell; text-align: right; padding-right: 12px; color: #484f58; user-select: none; min-width: 40px; }}
-.code-block .line-code {{ display: table-cell; }}
-.btn {{ display: inline-block; padding: 8px 16px; border-radius: 6px; font-size: 14px; font-weight: 500; border: 1px solid #30363d; background: #21262d; color: #c9d1d9; cursor: pointer; text-decoration: none; }}
-.btn:hover {{ background: #30363d; text-decoration: none; }}
-.btn-primary {{ background: #238636; border-color: #2ea043; color: #fff; }}
-.btn-primary:hover {{ background: #2ea043; }}
-.btn-danger {{ color: #f85149; border-color: #f85149; }}
-.btn-danger:hover {{ background: #da3633; color: #fff; }}
-.clone-bar {{ background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 10px 16px; margin-bottom: 16px; font-family: monospace; font-size: 13px; display: flex; align-items: center; gap: 12px; }}
-.clone-bar code {{ color: #7ee787; }}
-.clone-bar .clone-label {{ color: #8b949e; flex-shrink: 0; }}
-.stat-bar {{ display: flex; gap: 24px; margin-bottom: 16px; font-size: 13px; color: #8b949e; }}
-.stat-bar span {{ display: flex; align-items: center; gap: 4px; }}
-.readme-box {{ border: 1px solid #30363d; border-radius: 6px; padding: 24px; background: #161b22; margin-top: 16px; font-size: 14px; line-height: 1.6; }}
-.readme-box h1, .readme-box h2, .readme-box h3 {{ margin-top: 16px; margin-bottom: 8px; color: #f0f6fc; border-bottom: 1px solid #21262d; padding-bottom: 8px; }}
-.readme-box code {{ background: #21262d; padding: 2px 6px; border-radius: 4px; font-size: 13px; }}
-.readme-box pre {{ background: #0d1117; padding: 12px; border-radius: 6px; overflow-x: auto; font-size: 13px; }}
-.readme-box a {{ color: #58a6ff; }}
-.readme-box ul, .readme-box ol {{ padding-left: 24px; margin: 8px 0; }}
-form {{ margin: 24px 0; }}
-input[type="text"] {{ padding: 8px 12px; border-radius: 6px; border: 1px solid #30363d; background: #0d1117; color: #c9d1d9; font-size: 14px; width: 400px; max-width: 100%; }}
-.empty-state {{ text-align: center; padding: 48px 0; color: #8b949e; }}
-.empty-state p {{ margin: 8px 0; font-size: 16px; }}
-.error-box {{ background: #490202; border: 1px solid #f85149; border-radius: 6px; padding: 16px; margin: 16px 0; color: #f85149; }}
-</style>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{html.escape(title)} — git-forge</title>
+<style>{_BASE_CSS}</style>
 </head>
 <body>
-<div class="header">
-  <h1><a href="/">⚡ Git Forge</a></h1>
-  <div class="header-links">
-    <a href="/">Repositories</a>
-  </div>
+<div class="nav">
+  <a href="/"><strong>git-forge</strong></a>
+  <a href="/">Repositories</a>
 </div>
-{nav}
-<div class="container">
-{content}
-</div>
+{body}
 </body>
 </html>"""
 
 
-def render_page(title: str, content: str, nav: str = "") -> str:
-    return BASE_HTML.format(title=html.escape(title), content=content, nav=nav)
+def _run_git(repo_path: str, args: list[str], timeout: int = 15) -> str:
+    """Run a git command in the repo and return its stdout, or '' on failure."""
+    try:
+        result = subprocess.run(
+            ["git"] + args,
+            cwd=repo_path,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        return result.stdout if result.returncode == 0 else ""
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
+        return ""
 
 
-def nav_for_repo(repo_name: str, active: str = "") -> str:
-    """Navigation bar for inside a repo."""
-    tabs = [("files", "Code"), ("commits", "Commits")]
-    links = []
-    for key, label in tabs:
-        cls = ' class="active"' if key == active else ""
-        links.append(f'<a href="/{html.escape(repo_name)}/{key}"{cls}>{label}</a>')
-    repo_link = f'<a href="/{html.escape(repo_name)}/files">{html.escape(repo_name)}</a>'
-    return f'<div class="nav"><strong>{repo_link}</strong> {" ".join(links)}</div>'
+def _format_size(size: int) -> str:
+    """Human-readable file size."""
+    for unit in ("B", "KB", "MB", "GB"):
+        if abs(size) < 1024:
+            return f"{size} {unit}"
+        size //= 1024
+    return f"{size} TB"
 
 
-def _simple_markdown(text: str) -> str:
-    """Very basic markdown-to-HTML for README rendering (headings, code, links)."""
-    import re
-    lines = text.split("\n")
-    out = []
-    in_code = False
-    for line in lines:
-        if line.startswith("```"):
-            in_code = not in_code
-            if in_code:
-                out.append("<pre>")
-            else:
-                out.append("</pre>")
-            continue
-        if in_code:
-            out.append(html.escape(line))
-            continue
-        # Headings
-        if line.startswith("### "):
-            out.append(f"<h3>{html.escape(line[4:])}</h3>")
-        elif line.startswith("## "):
-            out.append(f"<h2>{html.escape(line[3:])}</h2>")
-        elif line.startswith("# "):
-            out.append(f"<h1>{html.escape(line[2:])}</h1>")
-        else:
-            # Basic inline formatting
-            line = html.escape(line)
-            line = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', line)
-            line = re.sub(r'`([^`]+)`', r'<code>\1</code>', line)
-            line = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'<a href="\2">\1</a>', line)
-            if line.strip():
-                out.append(f"<p>{line}</p>")
-            else:
-                out.append("<br>")
-
-    return "\n".join(out)
+def _breadcrumb(repo: str, path: str = "") -> str:
+    """Render a breadcrumb trail for a repo path."""
+    parts = [html.escape(repo)]
+    if path:
+        segments = path.strip("/").split("/")
+        for i, seg in enumerate(segments):
+            link = "/".join([""] + [repo, "tree"] + list(segments[: i + 1]))
+            parts.append(f'<a href="{html.escape(link)}">{html.escape(seg)}</a>')
+    return '<span class="breadcrumb">' + " / ".join(parts) + "</span>"
 
 
-def index_page() -> str:
-    """Homepage: list repos + clone form."""
-    repos = rm.list_repos()
-    items = []
-    for repo in repos:
-        name = repo["name"]
-        default_branch = rm.get_default_branch(repo["path"])
-        readme = rm.get_readme(repo["path"], default_branch)
-        stat = rm.get_repo_stat(repo["path"])
-        desc = ""
-        if readme:
-            first_line = readme.strip().split("\n")[0].lstrip("#").strip()
-            desc = first_line[:120]
-        last = stat.get("last_commit")
-        meta = ""
-        if last:
-            meta = f'<span>🕐 {last["date"][:10]}</span> <span>🌿 {stat["default_branch"]}</span>'
-        items.append(f"""
-        <li class="repo-item">
-          <div style="display: flex; justify-content: space-between; align-items: flex-start;">
-            <div>
-              <h3><a href="/{html.escape(name)}/files">{html.escape(name)}</a></h3>
-              <div class="desc">{html.escape(desc) if desc else '<em>No description</em>'}</div>
-              <div class="meta">{meta}</div>
-            </div>
-            <form method="POST" action="/{html.escape(name)}/delete" onsubmit="return confirm('Delete {html.escape(name)}?')" style="margin:0;">
-              <button type="submit" class="btn btn-danger" style="font-size:12px;padding:4px 10px;">🗑 Delete</button>
-            </form>
-          </div>
-        </li>""")
+# ═══════════════════════════════════════════════════════════════════
+# WebUI
+# ═══════════════════════════════════════════════════════════════════
 
-    repos_html = "".join(items) if items else '<div class="empty-state"><p>📂 No repositories yet</p><p>Clone one below to get started</p></div>'
+class WebUI:
+    """Render HTML pages for the forge web interface."""
 
-    content = f"""
-    <form method="POST" action="/clone" style="display: flex; gap: 8px; align-items: center;">
-      <input type="text" name="url" placeholder="https://github.com/user/repo.git" required>
-      <button type="submit" class="btn btn-primary">Clone</button>
-    </form>
-    <ul class="repo-list">{repos_html}</ul>
-    """
-    return render_page("Repositories", content)
+    def __init__(self, repos_dir: str, port: int = 8000):
+        self.repos_dir = repos_dir
+        self.port = port
 
+    # ── index ───────────────────────────────────────────────────
 
-def files_page(repo_name: str, branch: str = "HEAD", subpath: str = "", host: str = "localhost:8000") -> str:
-    """Browse files in a repo."""
-    repo = rm.get_repo(repo_name)
-    if not repo:
-        return render_page("Not Found", "<p>Repository not found.</p>")
-
-    if branch == "HEAD":
-        branch = rm.get_default_branch(repo["path"])
-
-    entries = rm.get_files(repo["path"], branch, subpath)
-    is_file = False
-    file_content = None
-
-    if not entries and subpath:
-        # Might be a single file
-        file_content = rm.get_file_content(repo["path"], branch, subpath)
-        if file_content is not None:
-            is_file = True
-
-    nav = nav_for_repo(repo_name, "files")
-
-    # Breadcrumbs
-    crumbs = [f'<a href="/{html.escape(repo_name)}/files">{html.escape(repo_name)}</a>']
-    if subpath:
-        parts = subpath.split("/")
-        for i, part in enumerate(parts):
-            link_path = "/".join(parts[:i + 1])
-            crumbs.append(f'<a href="/{html.escape(repo_name)}/files/{html.escape(link_path)}">{html.escape(part)}</a>')
-    breadcrumb = '<div class="breadcrumb"> / '.join(crumbs) + "</div>"
-
-    # Clone URL
-    clone_url = f"http://{host}/git/{html.escape(repo_name)}"
-    clone_bar = f'<div class="clone-bar"><span class="clone-label">🔽 Clone</span> <code>git clone {clone_url}</code></div>'
-
-    # Stat bar
-    stat = rm.get_repo_stat(repo["path"])
-    stat_html = ""
-    if stat["last_commit"]:
-        stat_html = f"""
-    <div class="stat-bar">
-      <span>🌿 <strong>{html.escape(stat['default_branch'])}</strong></span>
-      <span>🕐 Last commit: {stat['last_commit']['date'][:10]}</span>
-    </div>"""
-
-    if is_file:
-        file_content_html = html.escape(file_content or "")
-        # Add line numbers
-        numbered_lines = []
-        for i, line in enumerate(file_content_html.split("\n"), 1):
-            numbered_lines.append(
-                f'<div class="line"><span class="line-num">{i}</span><span class="line-code">{line}</span></div>'
+    def render_index(self, repos: list[str], flash_message: str = "",
+                     flash_kind: str = "") -> str:
+        """List all repositories with a clone form. Optionally show a flash."""
+        flash_html = ""
+        if flash_message:
+            css_class = "flash-success" if flash_kind == "success" else "flash-error"
+            flash_html = (
+                f'<div class="flash {css_class}">'
+                f'{html.escape(flash_message)}'
+                f'</div>'
             )
-        numbered_html = "\n".join(numbered_lines)
-        body = f"""
-        {clone_bar}
-        {stat_html}
-        {breadcrumb}
-        <div class="code-block"><pre>{numbered_html}</pre></div>
-        """
-    else:
-        rows = []
-        # Sort: directories first, then files
-        dirs = [e for e in entries if e["type"] == "tree"]
-        files = [e for e in entries if e["type"] != "tree"]
-        for e in dirs + files:
-            is_dir = e["type"] == "tree"
-            icon = "📁" if is_dir else file_icon(e["name"])
-            row_class = "dir" if is_dir else ""
-            link_path = f"{subpath}/{e['name']}" if subpath else e["name"]
-            rows.append(f"""
-            <div class="file-row">
-              <span class="file-icon">{icon}</span>
-              <span class="file-name {row_class}">
-                <a href="/{html.escape(repo_name)}/files/{html.escape(link_path)}">{html.escape(e['name'])}</a>
-              </span>
-              <span class="file-mode">{'dir' if is_dir else e['mode']}</span>
-            </div>""")
+
+        if repos:
+            rows = "".join(
+                f'<tr><td><a href="/{html.escape(r)}/">{html.escape(r)}</a></td></tr>'
+                for r in repos
+            )
+            repo_table = f"<table><thead><tr><th>Repository</th></tr></thead><tbody>{rows}</tbody></table>"
+        else:
+            repo_table = '<p class="empty">No repositories yet. Clone one below.</p>'
 
         body = f"""
-        {clone_bar}
-        {stat_html}
-        {breadcrumb}
-        <div class="file-list">{"".join(rows)}</div>
-        """
+<h1>Repositories</h1>
+{flash_html}
+{repo_table}
+<h2>Clone a Repository</h2>
+<form method="POST" action="/-/clone">
+  <input type="text" name="url" placeholder="https://github.com/user/repo.git" required>
+  <button type="submit">Clone</button>
+</form>
+"""
+        return _html_page("Repositories", body)
 
-    # If at root, show README
-    if not subpath:
-        readme = rm.get_readme(repo["path"], branch)
-        if readme:
-            readme_html = _simple_markdown(readme)
-            body += f'<div class="readme-box">{readme_html}</div>'
+    # ── repo home ───────────────────────────────────────────────
 
-    return render_page(f"{repo_name} at {subpath or '/'}", body, nav)
+    def render_repo_home(self, repo: str) -> str:
+        """Landing page for a single repository."""
+        repo_path = self._resolve(repo)
+        if not repo_path:
+            return _html_page("Not Found", "<h1>Repository not found</h1>")
 
+        desc = _run_git(repo_path, ["log", "-1", "--format=%s", "HEAD"]).strip()
+        if not desc:
+            desc = "(empty repository)"
 
-def commits_page(repo_name: str, branch: str = "HEAD") -> str:
-    """Browse commits in a repo."""
-    repo = rm.get_repo(repo_name)
-    if not repo:
-        return render_page("Not Found", "<p>Repository not found.</p>")
+        # Clone URL using the server's port
+        clone_cmd = f"git clone http://localhost:{self.port}/git/{repo}"
 
-    if branch == "HEAD":
-        branch = rm.get_default_branch(repo["path"])
+        body = f"""
+<h1>{html.escape(repo)}</h1>
+<p class="empty">{html.escape(desc)}</p>
 
-    commits = rm.get_commits(repo["path"], branch)
-    nav = nav_for_repo(repo_name, "commits")
+<h2>Clone</h2>
+<pre>{html.escape(clone_cmd)}</pre>
 
-    items = []
-    for c in commits:
-        items.append(f"""
-        <div class="commit-item">
-          <div class="commit-msg">{html.escape(c['message'])}</div>
-          <div class="commit-meta">
-            <span class="commit-hash">{c['short_hash']}</span>
-            {html.escape(c['author'])} committed on {c['date'][:10]}
-          </div>
-        </div>""")
+<p style="margin-top:16px">
+  <a href="/{html.escape(repo)}/tree/">📁 Browse files</a>
+  &nbsp;|&nbsp;
+  <a href="/{html.escape(repo)}/commits">📋 Commits</a>
+</p>
 
-    commits_html = "".join(items) if items else "<p>No commits found.</p>"
+<div style="margin-top:24px; display:flex; gap:12px">
+  <form method="POST" action="/-/fetch/{html.escape(repo)}">
+    <button type="submit">🔄 Fetch updates</button>
+  </form>
+  <form method="POST" action="/-/delete/{html.escape(repo)}"
+        onsubmit="return confirm('Delete {html.escape(repo)}? This is permanent.')">
+    <button type="submit" style="background:#da3633;border-color:#f85149">Delete Repository</button>
+  </form>
+</div>
+"""
+        return _html_page(repo, body)
 
-    body = f"""
-    <h2 style="margin-bottom: 16px;">Commits · {html.escape(branch)}</h2>
-    <div class="commit-list">{commits_html}</div>
-    """
+    # ── tree ────────────────────────────────────────────────────
 
-    return render_page(f"{repo_name} — Commits", body, nav)
+    def render_tree(self, repo: str, path: str = "") -> str:
+        """File tree browser."""
+        repo_path = self._resolve(repo)
+        if not repo_path:
+            return _html_page("Not Found", "<h1>Repository not found</h1>")
 
+        # git ls-tree expects no leading slash, and a trailing slash
+        # when listing a subdirectory's contents.
+        ls_path = path.strip("/")
+        if ls_path:
+            ls_path += "/"
 
-def error_page(title: str, message: str) -> str:
-    """Render an error page."""
-    content = f'<div class="error-box"><h2>{html.escape(title)}</h2><p>{html.escape(message)}</p></div><p><a href="/">← Back to repositories</a></p>'
-    return render_page(title, content)
+        output = _run_git(repo_path, ["ls-tree", "-l", "HEAD", ls_path])
+        if not output and ls_path:
+            # Empty directory or error — show breadcrumb + empty state
+            body = (
+                f"<h1>{html.escape(repo)}</h1>"
+                f"{_breadcrumb(repo, path)}"
+                f'<p class="empty">Nothing here — empty directory or invalid path.</p>'
+            )
+            return _html_page(f"{repo} — tree", body)
+        if not output:
+            # No HEAD yet (empty repo)
+            body = (
+                f"<h1>{html.escape(repo)}</h1>"
+                f'<p class="empty">No commits yet — the repository is empty.</p>'
+            )
+            return _html_page(f"{repo} — tree", body)
+
+        # Build a parent-directory link when inside a subdirectory
+        parent_link = ""
+        if path and path.strip("/"):
+            parent_parts = path.strip("/").split("/")
+            if len(parent_parts) > 1:
+                parent_path = "/".join(parent_parts[:-1])
+                parent_url = f"/{quote(repo)}/tree/{quote(parent_path)}"
+            else:
+                parent_url = f"/{quote(repo)}/tree/"
+            parent_link = (
+                f'<tr><td colspan="3">'
+                f'<a href="{html.escape(parent_url)}">📂 .. (parent directory)</a>'
+                f'</td></tr>'
+            )
+
+        rows = parent_link
+        for line in output.strip().split("\n"):
+            if not line:
+                continue
+            # Format: <mode> <type> <hash> <size>\t<name>
+            # (size is - for trees)
+            parts = line.split(None, 4)
+            if len(parts) < 5:
+                continue
+            mode_str, obj_type, obj_hash, size_str, name = parts
+            name = name.strip()
+
+            if obj_type == "tree":
+                icon = "📁"
+                subpath = f"{path.rstrip('/')}/{name}" if path else name
+                link = f"/{quote(repo)}/tree/{quote(subpath)}"
+                size_display = ""
+            else:
+                icon = "📄"
+                blob_path = f"{path.rstrip('/')}/{name}" if path else name
+                link = f"/{quote(repo)}/blob/{quote(blob_path)}"
+                size_display = _format_size(int(size_str)) if size_str != "-" else ""
+
+            row = (
+                f'<tr>'
+                f'<td><span class="file-icon">{icon}</span>'
+                f'<a href="{html.escape(link)}">{html.escape(name)}</a></td>'
+                f'<td><span class="mode">{html.escape(mode_str)}</span></td>'
+                f'<td>{size_display}</td>'
+                f'</tr>'
+            )
+            rows += row
+
+        body = f"""
+<h1>{html.escape(repo)}</h1>
+{_breadcrumb(repo, path)}
+<table>
+  <thead><tr><th>Name</th><th>Mode</th><th>Size</th></tr></thead>
+  <tbody>{rows}</tbody>
+</table>
+"""
+        return _html_page(f"{repo} — tree", body)
+
+    # ── blob ────────────────────────────────────────────────────
+
+    def render_blob(self, repo: str, path: str) -> str:
+        """Show file contents."""
+        repo_path = self._resolve(repo)
+        if not repo_path:
+            return _html_page("Not Found", "<h1>Repository not found</h1>")
+
+        content = _run_git(repo_path, ["show", f"HEAD:{path}"])
+        if not content:
+            return _html_page("Not Found", f"<h1>File not found</h1>{_breadcrumb(repo, path)}")
+
+        body = f"""
+<h1>{html.escape(repo)}</h1>
+{_breadcrumb(repo, path)}
+<pre><code>{html.escape(content)}</code></pre>
+"""
+        return _html_page(f"{repo} — {path.split('/')[-1]}", body)
+
+    # ── commits ─────────────────────────────────────────────────
+
+    def render_commits(self, repo: str) -> str:
+        """Commit log for a repository."""
+        repo_path = self._resolve(repo)
+        if not repo_path:
+            return _html_page("Not Found", "<h1>Repository not found</h1>")
+
+        output = _run_git(
+            repo_path,
+            ["log", "--format=%H%x00%an%x00%ai%x00%s", "-n", "50"],
+            timeout=15,
+        )
+        if not output:
+            body = f"<h1>{html.escape(repo)} — Commits</h1><p class='empty'>No commits yet.</p>"
+            return _html_page(f"{repo} — commits", body)
+
+        rows = ""
+        for line in output.strip().split("\n"):
+            if not line:
+                continue
+            fields = line.split("\x00")
+            if len(fields) < 4:
+                continue
+            obj_hash, author, date, subject = fields[0], fields[1], fields[2], fields[3]
+            short_hash = obj_hash[:8]
+            # Trim timezone offset for display
+            display_date = " ".join(date.split(" ")[:2])
+
+            rows += (
+                f'<tr>'
+                f'<td><span class="commit-hash">{html.escape(short_hash)}</span></td>'
+                f'<td>{html.escape(subject)}</td>'
+                f'<td>{html.escape(author)}</td>'
+                f'<td>{html.escape(display_date)}</td>'
+                f'</tr>'
+            )
+
+        body = f"""
+<h1>{html.escape(repo)} — Commits</h1>
+<table>
+  <thead><tr><th>Hash</th><th>Message</th><th>Author</th><th>Date</th></tr></thead>
+  <tbody>{rows}</tbody>
+</table>
+"""
+        return _html_page(f"{repo} — commits", body)
+
+    # ── helpers ─────────────────────────────────────────────────
+
+    def _resolve(self, name: str) -> str | None:
+        """Resolve a repo display name to its filesystem path."""
+        path = os.path.join(self.repos_dir, name)
+        if os.path.isdir(path) and os.path.isfile(os.path.join(path, "HEAD")):
+            return path
+        path_git = path + ".git"
+        if os.path.isdir(path_git) and os.path.isfile(os.path.join(path_git, "HEAD")):
+            return path_git
+        return None
+
+    @staticmethod
+    def _page(title: str, body: str) -> str:
+        """Convenience: render a full page without needing an instance."""
+        return _html_page(title, body)

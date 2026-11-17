@@ -1,187 +1,202 @@
 """
-Repo manager: clone GitHub repos, list local repos, get repo info.
-Uses subprocess to call git CLI.
+repo_manager.py — Manage bare git repositories on the filesystem.
+
+Operations:
+  - clone(url)       — clone a remote repository as a bare mirror
+  - fetch(name)      — fetch latest refs into an existing bare mirror
+  - delete(name)     — remove a repo directory
+  - list_repos()     — enumerate all bare repos on disk
+  - repo_exists(name)— check if a repo directory is present
+  - repo_path(name)  — return the full filesystem path for a repo
+  - repo_size(name)  — estimate on-disk size of a repo in bytes
+
+All operations are synchronous; cloning runs git in a subprocess.
 """
+
 import os
+import shutil
 import subprocess
-import shlex
-
-REPOS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "repos")
-
-
-def ensure_repos_dir():
-    os.makedirs(REPOS_DIR, exist_ok=True)
+import sys
+import re
+from urllib.parse import urlparse
 
 
-def clone_repo(github_url: str) -> dict:
-    """Clone a GitHub repo as bare into repos/.
-    Returns dict with status, name, path."""
-    ensure_repos_dir()
-    name = github_url.rstrip("/").split("/")[-1]
-    if name.endswith(".git"):
-        name = name[:-4]
+# ── helpers ─────────────────────────────────────────────────────
 
-    target = os.path.join(REPOS_DIR, name)
+def _slug_from_url(url: str) -> str:
+    """Extract 'owner/repo' from a URL and produce a directory name.
 
-    if os.path.exists(target):
-        return {"status": "exists", "name": name, "path": target}
+    Handles:
+      https://github.com/user/repo.git
+      https://github.com/user/repo
+      git@github.com:user/repo.git
+      https://gitlab.com/ns/project/subgroup/repo.git  → ns_project_subgroup_repo.git
+    """
+    url = url.rstrip("/")
 
-    cmd = ["git", "clone", "--bare", github_url, target]
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-        if result.returncode == 0:
-            return {"status": "cloned", "name": name, "path": target}
-        else:
-            return {"status": "error", "name": name, "error": result.stderr}
-    except subprocess.TimeoutExpired:
-        return {"status": "error", "name": name, "error": "Clone timed out"}
-    except Exception as e:
-        return {"status": "error", "name": name, "error": str(e)}
+    # SSH-style: git@github.com:owner/repo.git
+    m = re.match(r"^git@([^:]+):(.+)$", url)
+    if m:
+        path_part = m.group(2)
+    else:
+        parsed = urlparse(url)
+        path_part = parsed.path.lstrip("/")
 
+    # Drop trailing .git
+    path_part = path_part.rstrip(".git") if path_part.endswith(".git") else path_part
 
-def list_repos() -> list:
-    """List all cloned repos."""
-    ensure_repos_dir()
-    repos = []
-    if not os.path.exists(REPOS_DIR):
-        return repos
-    for entry in sorted(os.listdir(REPOS_DIR)):
-        full = os.path.join(REPOS_DIR, entry)
-        if os.path.isdir(full) and os.path.exists(os.path.join(full, "HEAD")):
-            repos.append({"name": entry, "path": full})
-    return repos
+    # Replace slashes with underscores
+    slug = path_part.replace("/", "_")
+    if not slug:
+        slug = "unknown"
+    return f"{slug}.git"
 
 
-def get_repo(name: str) -> dict | None:
-    """Get a repo by name."""
-    path = os.path.join(REPOS_DIR, name)
-    if os.path.isdir(path) and os.path.exists(os.path.join(path, "HEAD")):
-        return {"name": name, "path": path}
-    return None
+# ── RepoManager ─────────────────────────────────────────────────
 
+class RepoManager:
+    """Filesystem-backed manager for bare git repositories."""
 
-def git_command(repo_path: str, args: list, timeout: int = 30) -> tuple:
-    """Run a git command in a repo and return (rc, stdout, stderr)."""
-    cmd = ["git"] + args
-    env = os.environ.copy()
-    env["GIT_DIR"] = repo_path
-    try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout, env=env
-        )
-        return result.returncode, result.stdout, result.stderr
-    except Exception as e:
-        return -1, "", str(e)
+    def __init__(self, repos_dir: str):
+        self.repos_dir = repos_dir
+        os.makedirs(repos_dir, exist_ok=True)
 
+    # ── queries ─────────────────────────────────────────────────
 
-def get_branches(repo_path: str) -> list:
-    """List branches in a bare repo."""
-    rc, stdout, stderr = git_command(repo_path, ["branch"])
-    if rc != 0:
-        return []
-    branches = [b.strip().lstrip("* ") for b in stdout.strip().split("\n") if b.strip()]
-    return branches
+    def list_repos(self) -> list[str]:
+        """Return a sorted list of bare-repo directory names (without .git)."""
+        try:
+            entries = os.listdir(self.repos_dir)
+            repos = []
+            for name in entries:
+                full = os.path.join(self.repos_dir, name)
+                if not os.path.isdir(full):
+                    continue
+                # A bare repo has a HEAD file at minimum
+                if os.path.isfile(os.path.join(full, "HEAD")):
+                    clean = name[:-4] if name.endswith(".git") else name
+                    repos.append(clean)
+            repos.sort()
+            return repos
+        except FileNotFoundError:
+            return []
 
+    def repo_path(self, name: str) -> str:
+        """Return the on-disk path for a repo by its display name."""
+        path = os.path.join(self.repos_dir, name)
+        if os.path.isdir(path):
+            return path
+        path_git = path + ".git"
+        if os.path.isdir(path_git):
+            return path_git
+        return path  # caller can check existence
 
-def get_files(repo_path: str, branch: str = "HEAD", path: str = "") -> list:
-    """List files in a tree at given path.
-    Returns list of dicts with {name, type, mode}."""
-    treeish = f"{branch}:{path}" if path else branch
-    rc, stdout, stderr = git_command(repo_path, ["ls-tree", treeish])
-    if rc != 0:
-        return []
-    entries = []
-    for line in stdout.strip().split("\n"):
-        if not line:
-            continue
-        # Format: <mode> <type> <hash>\t<name>
-        parts = line.split(None, 3)
-        if len(parts) >= 4:
-            entries.append({
-                "mode": parts[0],
-                "type": parts[1],  # "tree" or "blob"
-                "hash": parts[2],
-                "name": parts[3].split("\t", 1)[-1] if "\t" in parts[3] else parts[3],
-            })
-    return entries
+    def repo_exists(self, name: str) -> bool:
+        """Check whether a repo (bare directory) exists."""
+        path = self.repo_path(name)
+        return os.path.isdir(path) and os.path.isfile(os.path.join(path, "HEAD"))
 
+    # ── mutations ───────────────────────────────────────────────
 
-def get_file_names(repo_path: str, branch: str = "HEAD", path: str = "") -> list:
-    """List just file/dir names (for backward compat)."""
-    treeish = f"{branch}:{path}" if path else branch
-    rc, stdout, stderr = git_command(repo_path, ["ls-tree", "--name-only", treeish])
-    if rc != 0:
-        return []
-    return [f for f in stdout.strip().split("\n") if f]
+    def clone(self, url: str) -> tuple[bool, str]:
+        """Clone a remote URL as a bare mirror.
 
+        Returns (success, message) where message is the repo name on success
+        or an error string on failure.
+        """
+        dest_name = _slug_from_url(url)
+        dest_path = os.path.join(self.repos_dir, dest_name)
 
-def get_file_content(repo_path: str, branch: str, filepath: str) -> str | None:
-    """Get file content at a given path in a branch."""
-    treeish = f"{branch}:{filepath}"
-    rc, stdout, stderr = git_command(repo_path, ["show", treeish])
-    if rc != 0:
-        return None
-    return stdout
+        if os.path.exists(dest_path):
+            return False, f"Repository '{dest_name}' already exists"
 
+        try:
+            subprocess.run(
+                ["git", "clone", "--bare", "--mirror", url, dest_path],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=300,
+                env=self._git_env(),
+            )
+        except subprocess.CalledProcessError as exc:
+            # Clean up partial clone
+            if os.path.exists(dest_path):
+                shutil.rmtree(dest_path, ignore_errors=True)
+            err = exc.stderr.strip() if exc.stderr else str(exc)
+            return False, f"Clone failed: {err}"
+        except FileNotFoundError:
+            return False, "git executable not found — is git installed?"
+        except subprocess.TimeoutExpired:
+            if os.path.exists(dest_path):
+                shutil.rmtree(dest_path, ignore_errors=True)
+            return False, "Clone timed out (> 5 minutes)"
 
-def get_commits(repo_path: str, branch: str = "HEAD", limit: int = 50) -> list:
-    """Get commit log."""
-    rc, stdout, stderr = git_command(
-        repo_path,
-        ["log", f"--max-count={limit}", "--format=%H|%an|%ae|%ai|%s", branch],
-        timeout=10,
-    )
-    if rc != 0 or not stdout.strip():
-        return []
-    commits = []
-    for line in stdout.strip().split("\n"):
-        parts = line.split("|", 4)
-        if len(parts) == 5:
-            commits.append({
-                "hash": parts[0],
-                "author": parts[1],
-                "email": parts[2],
-                "date": parts[3],
-                "message": parts[4],
-                "short_hash": parts[0][:7],
-            })
-    return commits
+        display = dest_name[:-4] if dest_name.endswith(".git") else dest_name
+        return True, display
 
+    def delete(self, name: str) -> tuple[bool, str]:
+        """Remove a repository directory.
 
-def get_readme(repo_path: str, branch: str = "HEAD") -> str | None:
-    """Find and return README content."""
-    files = get_file_names(repo_path, branch)
-    for f in files:
-        if f.lower().startswith("readme"):
-            return get_file_content(repo_path, branch, f)
-    return None
+        Returns (success, message).
+        """
+        path = self.repo_path(name)
+        if not os.path.isdir(path):
+            return False, f"Repository '{name}' does not exist"
+        try:
+            shutil.rmtree(path)
+            return True, f"Deleted '{name}'"
+        except OSError as exc:
+            return False, f"Could not delete '{name}': {exc}"
 
+    def fetch(self, name: str) -> tuple[bool, str]:
+        """Fetch latest refs into an existing bare mirror.
 
-def delete_repo(name: str) -> bool:
-    """Delete a cloned repo. Returns True if deleted."""
-    import shutil
-    path = os.path.join(REPOS_DIR, name)
-    if os.path.isdir(path) and os.path.exists(os.path.join(path, "HEAD")):
-        shutil.rmtree(path)
-        return True
-    return False
+        Returns (success, message).
+        """
+        path = self.repo_path(name)
+        if not self.repo_exists(name):
+            return False, f"Repository '{name}' not found"
+        try:
+            result = subprocess.run(
+                ["git", "fetch", "--all", "--prune"],
+                cwd=path,
+                capture_output=True,
+                text=True,
+                timeout=120,
+                env=self._git_env(),
+            )
+            if result.returncode != 0:
+                err = result.stderr.strip() or "unknown error"
+                return False, f"Fetch failed: {err}"
+            return True, f"Fetched updates for '{name}'"
+        except FileNotFoundError:
+            return False, "git executable not found"
+        except subprocess.TimeoutExpired:
+            return False, "Fetch timed out (> 2 minutes)"
 
+    def repo_size(self, name: str) -> int:
+        """Return the total on-disk size of a repo in bytes, or -1 if unknown."""
+        path = self.repo_path(name)
+        if not os.path.isdir(path):
+            return -1
+        total = 0
+        try:
+            for dirpath, _, filenames in os.walk(path):
+                for fn in filenames:
+                    fp = os.path.join(dirpath, fn)
+                    try:
+                        total += os.path.getsize(fp)
+                    except OSError:
+                        pass
+        except OSError:
+            return -1
+        return total
 
-def get_repo_stat(repo_path: str) -> dict:
-    """Get repo statistics: branch count, commit count, last commit."""
-    branches = get_branches(repo_path)
-    default_branch = get_default_branch(repo_path)
-    commits = get_commits(repo_path, default_branch, limit=1)
-    return {
-        "branch_count": len(branches),
-        "default_branch": default_branch,
-        "last_commit": commits[0] if commits else None,
-    }
+    # ── helpers ─────────────────────────────────────────────────
 
-
-def get_default_branch(repo_path: str) -> str:
-    """Get the default branch name."""
-    rc, stdout, stderr = git_command(repo_path, ["symbolic-ref", "HEAD"])
-    if rc == 0:
-        return stdout.strip().replace("refs/heads/", "")
-    return "main"
+    @staticmethod
+    def _git_env() -> dict:
+        env = os.environ.copy()
+        env["GIT_TERMINAL_PROMPT"] = "0"
+        return env

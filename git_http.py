@@ -1,97 +1,138 @@
 """
-Git smart HTTP protocol handler.
-Implements git-upload-pack (fetch/clone) and git-receive-pack (push).
+git_http.py — Git smart HTTP protocol handler.
 
-The git smart HTTP protocol works as follows:
-1. GET /info/refs?service=git-upload-pack  → advertise refs (for clone/fetch)
-2. POST /git-upload-pack with pkt-line body → actual pack transfer
-3. GET /info/refs?service=git-receive-pack → advertise refs (for push)
-4. POST /git-receive-pack with pkt-line body → receive pack
+Implements the git-http-backend protocol using subprocess calls to git.
+Handles:
+  - GET  info/refs?service=git-upload-pack    (clone advertisement)
+  - POST git-upload-pack                       (fetch / clone data)
+  - GET  info/refs?service=git-receive-pack    (push advertisement)
+  - POST git-receive-pack                      (push data)
+
+Pure stdlib — no WSGI, no Flask.  Passes raw request body through to git
+and streams raw git output back to the client.
 """
+
 import os
 import subprocess
-
-GIT_PATH = "/usr/bin/git"
+import sys
+from http.server import BaseHTTPRequestHandler
+from urllib.parse import parse_qs, urlparse, unquote
 
 
 class GitHTTPHandler:
-    """Handles git HTTP protocol requests for a given repo path."""
+    """Handle a single git smart-HTTP request on a bare repository."""
 
-    def __init__(self, repo_path: str):
-        self.repo_path = repo_path
+    def __init__(self, repos_dir: str):
+        self.repos_dir = repos_dir
 
-    def _run_git(self, args: list, input_data: bytes | None = None) -> tuple:
-        """Run a git subprocess. Returns (rc, stdout, stderr)."""
-        env = os.environ.copy()
-        # Required for git-http-backend behavior
-        env["GIT_PROJECT_ROOT"] = os.path.dirname(self.repo_path)
-        env["GIT_HTTP_EXPORT_ALL"] = "1"
-        env["PATH"] = "/usr/bin:/usr/lib/git-core:" + env.get("PATH", "")
+    # ── public entry point ──────────────────────────────────────
+
+    def handle(self, req: BaseHTTPRequestHandler, repo: str,
+               subpath: str, method: str) -> None:
+        """Entry point called from the main request handler."""
+        repo_path = os.path.join(self.repos_dir, repo)
+        if not repo_path.endswith(".git"):
+            repo_path += ".git"
+        if not os.path.isdir(repo_path):
+            req._send_plain(404, f"Repository '{repo}' not found")
+            return
+
+        if method == "GET" and subpath == "info/refs":
+            self._handle_info_refs(req, repo_path)
+        elif method == "POST" and subpath in ("git-upload-pack", "git-receive-pack"):
+            self._handle_rpc(req, repo_path, subpath)
+        else:
+            req._send_plain(404, "Unknown git endpoint")
+
+    # ── info/refs (advertisement) ───────────────────────────────
+
+    def _handle_info_refs(self, req, repo_path: str) -> None:
+        """GET /info/refs?service=git-upload-pack (or receive-pack).
+
+        Returns the service advertisement — the list of refs the server
+        offers, wrapped in the git packet-line format.
+        """
+        parsed = urlparse(req.path)
+        qs = parse_qs(parsed.query)
+        service = qs.get("service", [None])[0]
+
+        if service not in ("git-upload-pack", "git-receive-pack"):
+            req._send_plain(400, "Missing or unknown ?service= parameter")
+            return
+
+        # Map git-upload-pack → upload-pack (git subcommand)
+        git_cmd = service.replace("git-", "", 1)
 
         try:
-            proc = subprocess.run(
-                args,
-                capture_output=True,
-                input=input_data,
-                timeout=300,
-                env=env,
+            output = subprocess.check_output(
+                ["git", git_cmd, "--stateless-rpc", "--advertise-refs", repo_path],
+                stderr=subprocess.STDOUT,
+                timeout=30,
+                env=self._git_env(),
             )
-            return proc.returncode, proc.stdout, proc.stderr
-        except subprocess.TimeoutExpired:
-            return -1, b"", b"git operation timed out"
-        except Exception as e:
-            return -1, b"", str(e).encode()
+        except subprocess.CalledProcessError as exc:
+            req._send_plain(500, f"git error: {exc.output.decode(errors='replace')}")
+            return
+        except FileNotFoundError:
+            req._send_plain(500, f"git executable '{service}' not found on PATH")
+            return
 
-    def handle_get_info_refs(self, service: str) -> tuple:
-        """Handle GET /info/refs?service=<service>.
-        Returns (status_code, headers_dict, body_bytes)."""
-        if service not in ("git-upload-pack", "git-receive-pack"):
-            return 400, {}, b"Bad service"
-
-        # Convert git-upload-pack → upload-pack (git subcommand)
-        git_service = service.replace("git-", "", 1)
-
-        rc, stdout, stderr = self._run_git(
-            [GIT_PATH, git_service, "--stateless-rpc", "--advertise-refs", self.repo_path]
-        )
-
-        if rc != 0:
-            error_msg = stderr.decode("utf-8", errors="replace") if isinstance(stderr, bytes) else str(stderr)
-            return 500, {}, f"Git error: {error_msg}".encode()
-
-        # Format pkt-line header: service advertisement
+        # Wrap in packet-line format for HTTP transport
         packet = f"# service={service}\n"
-        length = len(packet) + 4
-        prefix = f"{length:04x}{packet}0000"
-        body = prefix.encode() + stdout
+        packet_len = len(packet) + 4  # 4-byte length prefix
+        pkt_line = f"{packet_len:04x}{packet}0000"
+        body = pkt_line.encode() + output
 
         content_type = f"application/x-{service}-advertisement"
-        headers = {
-            "Content-Type": content_type,
-            "Cache-Control": "no-cache",
-        }
-        return 200, headers, body
+        req.send_response(200)
+        req.send_header("Content-Type", content_type)
+        req.send_header("Cache-Control", "no-cache")
+        req.send_header("Content-Length", str(len(body)))
+        req.end_headers()
+        req.wfile.write(body)
 
-    def handle_post_rpc(self, service: str, body: bytes) -> tuple:
-        """Handle POST /git-upload-pack or /git-receive-pack.
-        Returns (status_code, headers_dict, body_bytes)."""
-        if service not in ("git-upload-pack", "git-receive-pack"):
-            return 400, {}, b"Bad service"
+    # ── git-upload-pack / git-receive-pack ───────────────────────
 
-        git_service = service.replace("git-", "", 1)
+    def _handle_rpc(self, req, repo_path: str, service: str) -> None:
+        """POST git-upload-pack or git-receive-pack — the real data exchange."""
+        content_length = int(req.headers.get("Content-Length", 0))
+        if content_length == 0:
+            req._send_plain(400, "Empty body — nothing to do")
+            return
 
-        rc, stdout, stderr = self._run_git(
-            [GIT_PATH, git_service, "--stateless-rpc", self.repo_path],
-            input_data=body,
+        input_data = req.rfile.read(content_length)
+        git_cmd = service.replace("git-", "", 1)
+
+        proc = subprocess.Popen(
+            ["git", git_cmd, "--stateless-rpc", repo_path],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=self._git_env(),
         )
+        stdout, stderr = proc.communicate(input_data, timeout=120)
+
+        if proc.returncode != 0:
+            err_text = stderr.decode(errors="replace")
+            req._send_plain(500, f"git {service} failed (rc={proc.returncode}): {err_text}")
+            return
 
         content_type = f"application/x-{service}-result"
-        headers = {
-            "Content-Type": content_type,
-            "Cache-Control": "no-cache",
-        }
+        req.send_response(200)
+        req.send_header("Content-Type", content_type)
+        req.send_header("Cache-Control", "no-cache")
+        req.send_header("Content-Length", str(len(stdout)))
+        req.end_headers()
+        req.wfile.write(stdout)
 
-        if rc != 0:
-            return 500, headers, stderr
+    # ── helpers ─────────────────────────────────────────────────
 
-        return 200, headers, stdout
+    @staticmethod
+    def _git_env() -> dict:
+        """Return an environment dict that prevents git from doing anything
+        interactive or reading user-level config."""
+        env = os.environ.copy()
+        env["GIT_TERMINAL_PROMPT"] = "0"
+        env["GIT_CONFIG_NOSYSTEM"] = "1"
+        env["GIT_CONFIG_NOGLOBAL"] = "1"
+        return env
